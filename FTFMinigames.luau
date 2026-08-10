@@ -37,11 +37,11 @@ local OldNamecall
 OldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(Self, ...)
     local Method = getnamecallmethod()
     local Caller = checkcaller()
-    local Arguments = {...}
+    local Arguments = table.pack(...)
 
     if NeverFailMinigames and not Caller and Method == "FireServer" and Arguments[1] == "SetPlayerMinigameResult" and Arguments[2] == false then
         Arguments[2] = true
     end
 
-    return OldNamecall(Self, table.unpack(Arguments))
+    return OldNamecall(Self, table.unpack(Arguments, 1, Arguments.n))
 end))
