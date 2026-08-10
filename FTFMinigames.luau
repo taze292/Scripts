@@ -39,7 +39,7 @@ OldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(Self, ...)
     local Caller = checkcaller()
     local Arguments = {...}
 
-    if not Caller and Method == "FireServer" and Arguments[1] == "SetPlayerMinigameResult" and Arguments[2] == false then
+    if NeverFailMinigames and not Caller and Method == "FireServer" and Arguments[1] == "SetPlayerMinigameResult" and Arguments[2] == false then
         Arguments[2] = true
     end
 
