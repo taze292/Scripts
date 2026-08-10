@@ -1,6 +1,3 @@
-getgenv().AutoCompleteMinigames = false
-getgenv().NeverFailMinigames = true
-
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Remote = ReplicatedStorage:FindFirstChild("RemoteEvent")
 local Players = game:GetService("Players")
