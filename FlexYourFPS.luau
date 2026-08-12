@@ -8,7 +8,6 @@ OldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(Self, Pack
         local ActualFPS = math.random(FPS - FPSVariation, FPS + FPSVariation)
         local ActualMemory = math.random(MemoryUsage - MemoryVariation, MemoryUsage + MemoryVariation)
 
-        print(Enum.QualityLevel:FromValue(Graphics))
         rawset(Packet, "fps", ActualFPS)
         rawset(Packet, "gfx", Enum.SavedQualitySetting:FromValue(Graphics))
         rawset(Packet, "mem", ActualMemory)
