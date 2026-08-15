@@ -34,7 +34,7 @@ local ReadVLQ = function(Buffer, Offset)
 end
 
 -- Init
-local URL = "https://bitmidi.com/uploads/72257.mid" or ...
+local URL = ... or "https://bitmidi.com/uploads/72257.mid"
 local MIDI = FromString(game:HttpGet(URL))
 
 if ReadString(MIDI, 0, 4) ~= "MThd" then
