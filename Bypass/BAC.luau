@@ -1,4 +1,4 @@
--- Game: https://www.roblox.com/games/107778070777162
+-- Tested on Steal An Egg & Grow a Chicken Fighter
 
 -- local DetectionFunctions = filtergc("function", {
 --     Name = "o"
