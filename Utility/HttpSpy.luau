@@ -4,10 +4,12 @@
     @taze29 - Main Developer
     @deaggilisspees - Providing Detections
     Killa (idk his discord) - Major bug fix
+    @actualmasteroogway - "detection" (kinda)
 
     Taze - https://v3rm.net/members/.97636/
     De Aggilis - https://v3rm.net/members/.79930/
     Killa - https://v3rm.net/members/.2976/
+    MasterOogway - https://v3rm.net/members/.6431/
 
 ]]--
 
@@ -397,12 +399,19 @@ local OutputTable
 local Output
 local Dump
 
-OutputTable = function(Table, Indent)
+OutputTable = function(Table, Indent, Seen)
     Indent = Indent or 0
+    Seen = Seen or {}
 
     local DoubleIndent = string.rep("    ", Indent + 1)
     local IndentString = string.rep("    ", Indent)
 
+    if Seen[Table] then
+        Output(`{IndentString}<Circular Reference>`)
+        return
+    end
+
+    Seen[Table] = true
     for Key, Value in next, Table do
         if type(Value) == "string" then
             Value = GetOutputString(Value)
@@ -411,7 +420,7 @@ OutputTable = function(Table, Indent)
         Output(`{IndentString}[{Key}: {type(Value)}] {Value}`)
 
         if type(Value) == "table" then
-            OutputTable(Value, Indent + 1)
+            OutputTable(Value, Indent + 1, Seen)
             continue
         end
 

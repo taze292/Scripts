@@ -1,3 +1,4 @@
+-- Game: https://www.roblox.com/games/112731528776884
 local DetectionFunctions = filtergc("function", { Name = "f" })
 
 for _, Function in DetectionFunctions do
