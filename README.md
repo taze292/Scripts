@@ -1,2 +1,4 @@
-gonna be updating this repository very frequently with small stuff i make  
-join the discord (scripting community (kinda)): https://discord.gg/tazer
+This is my repository for every script I make (if I want it open source)  
+
+I will be updating this very often, for more major releases join the discord or notifications about releases  
+https://discord.gg/tazer
