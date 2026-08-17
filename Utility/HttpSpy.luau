@@ -417,7 +417,8 @@ OutputTable = function(Table, Indent, Seen)
             Value = GetOutputString(Value)
         end
 
-        Output(`{IndentString}[{Key}: {type(Value)}] {Value}`)
+        local ValueType = type(Value)
+        Output(`{IndentString}[{Key}: {ValueType}] {ValueType == "table" and "table" or Value}`)
 
         if type(Value) == "table" then
             OutputTable(Value, Indent + 1, Seen)
