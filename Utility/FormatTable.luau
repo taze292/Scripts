@@ -34,7 +34,7 @@ FormatTable = function(Table, Indent)
 end
 
 OutputTable = function(Table, Indent)
-    return FormatTable(Table, Indent or 0)
+    return print(FormatTable(Table, Indent or 0))
 end
 
 return OutputTable, FormatTable
