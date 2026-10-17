@@ -97,6 +97,9 @@ local OriginalWalkSpeeds = {}
 local WalkSpeedHumanoid = nil
 local WalkSpeedConnection = nil
 local MarkerLabels = {}
+local MarkerTargets = {}
+local MarkerNextRefresh = 0
+local MarkerSceneEpoch = nil
 local IdleConnections = {}
 local FailedTargets = {}
 local SeedNames = {}
@@ -128,6 +131,51 @@ local ForageStatus = "Idle"
 local SupplyStatus = "Idle"
 local ChestStatus = "Idle"
 local GiftStatus = "Idle"
+local Fishing = {
+	Utilities = require(Shared.utilities.fishing),
+	Data = require(Shared.data.fishing),
+	Water = require(Shared.data["fishing-water"]),
+	Atom = require(Client.store["fishing-atom"]).fishingAtom,
+	Runtime = require(Client.store["fishing-minigame-runtime-atom"]).fishingMinigameRuntimeAtom,
+	Runner = require(Client.utilities["fishing-minigame-runner"]),
+	Controller = Flamework.resolveDependency("client/controllers/gameplay/items/fishing-rod-controller@FishingRodController"),
+	Enabled = false,
+	Generation = 0,
+	Owned = false,
+	SessionId = nil,
+	Status = "Idle",
+	Catches = 0,
+	Treasures = 0,
+	Pending = {},
+	SpotNames = {"Nearest"},
+	RodNames = {"Best owned"},
+}
+local Mining = {
+	Utilities = require(Shared.utilities.mining),
+	Data = require(Shared.data.mining),
+	Atom = require(Client.store["mining-atom"]).miningAtom,
+	Runtime = require(Client.store["mining-minigame-runtime-atom"]).miningMinigameRuntimeAtom,
+	Controller = Flamework.resolveDependency("client/controllers/gameplay/items/pickaxe-controller@PickaxeController"),
+	Travel = require(Client.actions["travel-actions"]).sceneTravelAction,
+	Enabled = false,
+	Generation = 0,
+	Owned = false,
+	SessionId = nil,
+	Status = "Idle",
+	Nodes = 0,
+	Pending = {},
+	PickaxeNames = {"Best owned"},
+	NodeNames = {},
+}
+local Crafting = {
+	Data = require(Shared.data.crafting),
+	Scene = require(Shared.utilities.furniture.scene),
+	Enabled = false,
+	Generation = 0,
+	Status = "Idle",
+	Recipes = {},
+	Completed = 0,
+}
 
 for ItemId, Data in ItemData do
 	if Data.type == "seeds" and Data.use and CropRegistry.getCropData(Data.use.crop) then
@@ -144,6 +192,33 @@ end
 
 table.sort(SeedNames)
 table.sort(ProtectedItemNames)
+
+for ItemId in Fishing.Data.FISHING_ROD_STATS_BY_ITEM_ID do
+	table.insert(Fishing.RodNames, ItemId)
+end
+
+for ItemId in Mining.Data.PICKAXE_STATS_BY_ITEM_ID do
+	table.insert(Mining.PickaxeNames, ItemId)
+end
+
+for NodeId in Mining.Data.mineNodes do
+	table.insert(Mining.NodeNames, NodeId)
+end
+
+for _, Area in Fishing.Water.MAIN_MAP_OCEAN_FISHING_AREAS do
+	table.insert(Fishing.SpotNames, Area.id)
+end
+
+for _, Tab in Crafting.Data.CRAFTING_STATIONS["tool-workbench"].tabs do
+	for _, Recipe in Tab.recipes do
+		table.insert(Crafting.Recipes, Recipe.id)
+	end
+end
+
+table.sort(Mining.NodeNames)
+table.sort(Crafting.Recipes)
+table.sort(Fishing.RodNames)
+table.sort(Mining.PickaxeNames)
 
 -- Functions
 local function GetCharacter()
@@ -661,14 +736,441 @@ local function CollectForage(Id, Name, Position, Active)
 	RestoreMovement(not Active())
 end
 
+-- Tool Functions
+local function GetFishingRod()
+	local Selected = Options.FishingRod.Value
+	local BestId = nil
+	local BestTier = -1
+
+	for ItemId, Stats in Fishing.Data.FISHING_ROD_STATS_BY_ITEM_ID do
+		if (Selected == "Best owned" or Selected == ItemId) and CountItem(ItemId) > 0 and Stats.tier > BestTier then
+			BestId = ItemId
+			BestTier = Stats.tier
+		end
+	end
+
+	return BestId
+end
+
+local function GetPickaxe()
+	local Selected = Options.MiningPickaxe.Value
+	local BestId = nil
+	local BestStats = nil
+
+	for ItemId, Stats in Mining.Data.PICKAXE_STATS_BY_ITEM_ID do
+		if (Selected == "Best owned" or Selected == ItemId) and CountItem(ItemId) > 0 and (not BestStats or Stats.tier > BestStats.tier) then
+			BestId = ItemId
+			BestStats = Stats
+		end
+	end
+
+	return BestId, BestStats
+end
+
+local function ToolMovementValid(Active)
+	local Scene = ActiveScene.activeSceneStateAtom()
+
+	return Active() and MovementBusy and GetCharacter() == MovementCharacter and Scene.sceneId == MovementSceneId and Scene.epoch == MovementSceneEpoch
+end
+
+local function StopFishing()
+	if Fishing.Owned then
+		Fishing.Runner.setFishingMinigameUseHeld(false)
+		Fishing.Controller:stopFishing(true)
+		Fishing.Owned = false
+		Fishing.SessionId = nil
+	end
+end
+
+local function StopMining()
+	if Mining.Owned then
+		Mining.Controller:stopMining(true)
+		Mining.Owned = false
+		Mining.SessionId = nil
+	end
+end
+
+-- Fishing Functions
+local function GetFishingSpot()
+	local Position = CharacterPosition.getPlayerFeetPosition(LocalPlayer)
+	local BestStand = nil
+	local BestCast = nil
+	local BestId = nil
+	local BestDistance = math.huge
+
+	if not Position then
+		return
+	end
+
+	for _, Area in Fishing.Water.MAIN_MAP_OCEAN_FISHING_AREAS do
+		if Options.FishingSpot.Value ~= "Nearest" and Options.FishingSpot.Value ~= Area.id then
+			continue
+		end
+
+		if not CanRetry(`fishing:{Area.id}`) then
+			continue
+		end
+
+		if not Fishing.Water.isFishingCastTarget("main-map", Area.center) then
+			continue
+		end
+
+		for Distance = 80, 160, 20 do
+			for Direction = 0, 7 do
+				local Angle = Direction * math.pi / 4
+				local Stand = Area.center + Vector2.new(math.cos(Angle), math.sin(Angle)) * Distance
+				local Center = Stand + Vector2.new(0, Sugar.DEFAULT_CHARACTER_CELL_SIZE.Y / 2)
+				local TravelDistance = (Stand - Position).Magnitude
+
+				if Fishing.Water.isWaterPosition(Stand) or Fishing.Utilities.getOceanFishingCastDistanceViolation(Area.center, Center) then
+					continue
+				end
+
+				if TravelDistance < BestDistance then
+					BestStand = Stand
+					BestCast = Area.center
+					BestId = Area.id
+					BestDistance = TravelDistance
+				end
+			end
+		end
+	end
+
+	return BestStand, BestCast, BestId
+end
+
+local function Fish(Active)
+	local RodId = GetFishingRod()
+
+	if not RodId then
+		Fishing.Status = "Craft or equip a fishing rod"
+		return
+	end
+
+	local Stand, Cast, SpotId = GetFishingSpot()
+
+	if not Stand then
+		Fishing.Status = "Waiting for a fishing spot"
+		return
+	end
+
+	if not BeginMovement(Stand, Active) then
+		return
+	end
+
+	if Fishing.Utilities.getOceanFishingCastDistanceViolation(Cast, CharacterPosition.getPlayerCenterPosition(LocalPlayer)) then
+		Fishing.Status = "Fishing spot is obstructed"
+		RestoreMovement(false)
+		return
+	end
+
+	Fishing.Owned = true
+	Fishing.Controller:startFishing(RodId)
+	Fishing.Status = `Casting: {SpotId}`
+	Fishing.Controller.actions.cast:run(Cast)
+	Fishing.SessionId = Fishing.Atom().sessionId
+
+	if Fishing.SessionId then
+		Fishing.Pending[Fishing.SessionId] = SpotId
+	end
+
+	local Deadline = os.clock() + 75
+
+	while ToolMovementValid(Active) and os.clock() < Deadline do
+		local State = Fishing.Atom()
+
+		if State.phase == "ready" or State.phase == "inactive" then
+			break
+		end
+
+		if State.phase == "bite" then
+			Fishing.Status = "Hooking fish"
+			Fishing.Controller:hookFish()
+		elseif State.phase == "minigame" then
+			local Runtime = Fishing.Runtime()
+			local Simulation = Runtime.state
+
+			if Simulation then
+				local Target = Simulation.fish.center + Simulation.fish.velocity * 0.1
+				local PredictedBar = Simulation.barCenter + Simulation.barVelocity * 0.12
+
+				Fishing.Runner.setFishingMinigameUseHeld(PredictedBar > Target)
+				Fishing.Status = `Reeling: {math.floor(Simulation.progress * 100)}%`
+			end
+		elseif State.phase == "settling" then
+			Fishing.Status = "Waiting for catch"
+		end
+
+		RunService.RenderStepped:Wait()
+	end
+
+	StopFishing()
+	RestoreMovement(not Active())
+end
+
+-- Mining Functions
+local function GetMineTarget(Stats)
+	local Position = CharacterPosition.getPlayerFeetPosition(LocalPlayer)
+	local BestId = nil
+	local BestPosition = nil
+	local BestName = nil
+	local BestScore = math.huge
+
+	if not Position then
+		return
+	end
+
+	for Id, Node in SceneReplica.getAuthoritativeScene().nodesById do
+		local Identity = GetComponent(Node.entity, "MineIdentity")
+		local Data = Identity and Mining.Utilities.getMineNodeData(Identity.nodeId)
+
+		if not Data or Stats.tier < Data.minPickaxeTier or not Options.MiningNodes.Value[Identity.nodeId] or not CanRetry(Id) then
+			continue
+		end
+
+		local TargetPosition = GetObjectPosition(Id)
+
+		if not TargetPosition then
+			continue
+		end
+
+		local Score = (TargetPosition - Position).Magnitude
+
+		if Options.MiningPriority.Value == "Ore first" and Identity.nodeId == "stone" then
+			Score += 100000
+		end
+
+		if Score < BestScore then
+			BestId = Id
+			BestPosition = TargetPosition
+			BestName = Identity.nodeId
+			BestScore = Score
+		end
+	end
+
+	return BestId, BestPosition, BestName
+end
+
+local function TravelMine(Destination, Active)
+	local Position = nil
+
+	if Destination == "surface" then
+		Position = GetObjectPosition("mine-elevator")
+	elseif ActiveScene.activeSceneIdAtom() == "main-map" then
+		Position = Mining.Data.MINE_ENTRY_WORLD_POSITION
+	else
+		for Id, Node in SceneReplica.getAuthoritativeScene().nodesById do
+			local Interaction = GetComponent(Node.entity, "Interactable")
+
+			if Interaction and Interaction.action and Interaction.action.type == "scene" and Interaction.action.sceneId == Destination then
+				Position = GetObjectPosition(Id)
+				break
+			end
+		end
+	end
+
+	if not Position or not BeginMovement(Position, Active) then
+		return
+	end
+
+	Mining.Status = Destination == "surface" and "Returning to surface" or "Entering mine"
+	Mining.Travel:run(Destination)
+
+	local Deadline = os.clock() + 12
+
+	while Active() and os.clock() < Deadline do
+		local SceneId = ActiveScene.activeSceneIdAtom()
+
+		if (Destination == "surface" and SceneId == "main-map") or (Destination ~= "surface" and SceneId == Destination) then
+			break
+		end
+
+		task.wait(0.1)
+	end
+
+	RestoreMovement(false)
+
+	return ActiveScene.activeSceneIdAtom() == (Destination == "surface" and "main-map" or Destination)
+end
+
+local function Mine(Active)
+	local PickaxeId, Stats = GetPickaxe()
+
+	if not PickaxeId then
+		Mining.Status = "Craft or equip a pickaxe"
+		return
+	end
+
+	local Id, Position, Name = GetMineTarget(Stats)
+
+	if not Id then
+		Mining.Status = "Waiting for matching nodes"
+		local NextScene = Mining.Utilities.getNextMineSceneId(ActiveScene.activeSceneIdAtom())
+
+		if Toggles.MineDescend.Value and NextScene then
+			TravelMine(NextScene, Active)
+		end
+
+		return
+	end
+
+	if not BeginMovement(Position + Vector2.new(0, 12), Active) then
+		return
+	end
+
+	Mining.Owned = true
+	Mining.Status = `Mining: {Name}`
+	Mining.Controller:startMining(PickaxeId)
+	Mining.Controller:tryStartMining(Id)
+	Mining.SessionId = Mining.Atom().sessionId
+
+	local Deadline = os.clock() + 65
+	local NextStrikeAt = 0
+	local StartedAt = os.clock()
+
+	while ToolMovementValid(Active) and os.clock() < Deadline do
+		local State = Mining.Atom()
+
+		if State.phase == "minigame" then
+			Mining.SessionId = State.sessionId
+			Mining.Pending[State.sessionId] = true
+			local Runtime = Mining.Runtime()
+			local Marker = (workspace:GetServerTimeNow() - Runtime.startTime) * State.config.markerSpeed
+			local Offset = (Marker - State.config.zoneStart) % 1
+
+			if os.clock() >= NextStrikeAt and Offset >= State.config.zoneSize * 0.35 and Offset <= State.config.zoneSize * 0.65 then
+				Mining.Controller:strikeIfMining()
+				NextStrikeAt = os.clock() + Mining.Data.MINING_STRIKE_MIN_INTERVAL_SECONDS + 0.03
+			end
+		elseif os.clock() - StartedAt > 0.5 and State.phase ~= "pending" then
+			break
+		end
+
+		RunService.RenderStepped:Wait()
+	end
+
+	StopMining()
+
+	if SceneReplica.getAuthoritativeScene().nodesById[Id] then
+		FailedTargets[Id] = os.clock() + 5
+	end
+
+	RestoreMovement(not Active())
+end
+
+-- Crafting Functions
+local function GetWorkbench()
+	local Account = PlayerSelectors.getLocalAccount()
+	local Scene = SceneReplica.getAuthoritativeScene()
+
+	for Id, Node in Scene.nodesById do
+		if Crafting.Data.getWorldCraftingStationId(Node.entity.objectRegistryId or "") == "tool-workbench" then
+			local Position = GetObjectPosition(Id)
+
+			if Position then
+				return {kind = "world", objectId = Id}, Position
+			end
+		end
+	end
+
+	for _, House in Account and Account.houses.entries or {} do
+		for _, Furniture in House.furniture do
+			local Definition = Crafting.Scene.getPlacedFurnitureDefinition(Furniture)
+
+			if Furniture.ownerUserId == LocalPlayer.UserId and Definition and Definition.craftingStationId == "tool-workbench" then
+				local Position = GetObjectPosition(Furniture.id)
+
+				if Position then
+					return {kind = "placement", placementId = Furniture.id}, Position
+				end
+			end
+		end
+	end
+end
+
+local function CraftTool(Active)
+	local Recipe = Crafting.Data.getCraftingRecipe("tool-workbench", Options.ToolRecipe.Value)
+	local Account = PlayerSelectors.getLocalAccount()
+
+	if not Recipe or not Account then
+		return
+	end
+
+	if CountItem(Recipe.rewards[1].itemId) >= Options.CraftTarget.Value then
+		Crafting.Status = "Crafting target reached"
+		return
+	end
+
+	for _, Ingredient in Recipe.ingredients do
+		local Missing = Ingredient.quantity - CountItem(Ingredient.itemId)
+
+		if Missing > 0 then
+			Crafting.Status = `Need {Missing} {Ingredient.itemId}`
+			return
+		end
+	end
+
+	if Recipe.cost.currency ~= "gold" or Account.gold - Recipe.cost.amount < Options.GoldReserve.Value then
+		Crafting.Status = "Gold reserve reached"
+		return
+	end
+
+	local Target, Position = GetWorkbench()
+
+	if not Target then
+		Crafting.Status = "Visit your tool workbench"
+		return
+	end
+
+	if not BeginMovement(Position + Vector2.new(0, 20), Active) then
+		return
+	end
+
+	Crafting.Status = "Crafting tool"
+	local Before = CountItem(Recipe.rewards[1].itemId)
+	local Success, Resolved, Response = pcall(function()
+		return Network.Functions.craftItem:invokeWithTimeout(10, {
+			context = SceneContext.createSceneRequestContext("craft-item"),
+			target = Target,
+			recipeId = Recipe.id,
+		}):await()
+	end)
+
+	if Active() and Success and Resolved and Response and Response.ok then
+		if WaitForResult(function()
+			return CountItem(Recipe.rewards[1].itemId) > Before
+		end, Active) then
+			Crafting.Completed += 1
+			Crafting.Status = "Tool crafted"
+		else
+			Crafting.Status = "Craft was not confirmed"
+		end
+	elseif Active() then
+		Crafting.Status = Response and Response.reason or "Craft request failed"
+	end
+
+	RestoreMovement(not Active())
+end
+
 -- Trading Functions
 local function GetSellSlots()
 	local Account = PlayerSelectors.getLocalAccount()
 	local Totals = {}
 	local Slots = {}
+	local CraftIngredients = {}
 
 	if not Account then
 		return Slots
+	end
+
+	if Crafting.Enabled then
+		local Recipe = Crafting.Data.getCraftingRecipe("tool-workbench", Options.ToolRecipe.Value)
+
+		if Recipe and CountItem(Recipe.rewards[1].itemId) < Options.CraftTarget.Value then
+			for _, Ingredient in Recipe.ingredients do
+				CraftIngredients[Ingredient.itemId] = true
+			end
+		end
 	end
 
 	for _, Slot in Account.inventory do
@@ -682,7 +1184,7 @@ local function GetSellSlots()
 			continue
 		end
 
-		if Options.ProtectedItems.Value[Slot.itemId] or (Toggles.KeepRare.Value and Data.rarity ~= "common" and Data.rarity ~= "uncommon") then
+		if CraftIngredients[Slot.itemId] or Options.ProtectedItems.Value[Slot.itemId] or (Toggles.KeepRare.Value and Data.rarity ~= "common" and Data.rarity ~= "uncommon") then
 			continue
 		end
 
@@ -939,64 +1441,90 @@ local function ClearMarkers()
 	end
 
 	table.clear(MarkerLabels)
+	table.clear(MarkerTargets)
+	MarkerNextRefresh = 0
 end
 
 local function UpdateMarkers()
 	local Camera = workspace.CurrentCamera
 	local Position = CharacterPosition.getPlayerFeetPosition(LocalPlayer)
 	local Account = PlayerSelectors.getLocalAccount()
-	local Targets = {}
 	local Scene = SceneReplica.getAuthoritativeScene()
+	local SceneState = ActiveScene.activeSceneStateAtom()
 
 	if not Camera or not Position or not Account then
 		ClearMarkers()
 		return
 	end
 
-	if Options.MarkerTypes.Value["Rare forage"] then
-		for _, Id in Scene.childrenByParentId["folder/forageables"] or {} do
-			local Node = Scene.nodesById[Id]
-			local Identity = Node and GetComponent(Node.entity, "ForageIdentity")
+	if os.clock() >= MarkerNextRefresh or SceneState.epoch ~= MarkerSceneEpoch then
+		local Targets = {}
 
-			if Identity and (Identity.forageableId == "dewcap" or Identity.forageableId == "gem-stone") then
-				table.insert(Targets, {
-					Position = GetObjectPosition(Id),
-					Name = Node.entity.name,
-					Color = Color3.fromRGB(184, 156, 222),
-				})
+		if Options.MarkerTypes.Value["Rare forage"] then
+			for _, Id in Scene.childrenByParentId["folder/forageables"] or {} do
+				local Node = Scene.nodesById[Id]
+				local Identity = Node and GetComponent(Node.entity, "ForageIdentity")
+
+				if Identity and (Identity.forageableId == "dewcap" or Identity.forageableId == "gem-stone") then
+					table.insert(Targets, {
+						Id = Id,
+						Name = Node.entity.name,
+						Color = Color3.fromRGB(184, 156, 222),
+					})
+				end
 			end
 		end
-	end
 
-	if Options.MarkerTypes.Value["Ripe crops"] then
-		for _, Crop in PlayerSelectors.getLocalCrops() do
-			local Data = CropRegistry.getCropData(Crop.type)
+		if Options.MarkerTypes.Value["Ripe crops"] then
+			for _, Crop in PlayerSelectors.getLocalCrops() do
+				local Data = CropRegistry.getCropData(Crop.type)
 
-			if Data and Crop.stage == CropStage.getCropStage(Data, "ripe") then
-				table.insert(Targets, {
-					Position = GetObjectPosition(Crop.id),
-					Name = Crop.type,
-					Color = Color3.fromRGB(153, 207, 156),
-				})
+				if Data and Crop.stage == CropStage.getCropStage(Data, "ripe") then
+					table.insert(Targets, {
+						Id = Crop.id,
+						Name = Crop.type,
+						Color = Color3.fromRGB(153, 207, 156),
+					})
+				end
 			end
 		end
-	end
 
-	if Options.MarkerTypes.Value["Treasure chests"] then
-		for _, Chest in TreasureChests.TREASURE_CHESTS do
-			if not table.find(Account.claimedTreasureChestIds, Chest.id) then
-				table.insert(Targets, {
-					Position = GetObjectPosition(TreasureChests.getTreasureChestObjectId(Chest.id)),
-					Name = "Treasure chest",
-					Color = Library.Scheme.AccentColor,
-				})
+		if Options.MarkerTypes.Value["Treasure chests"] then
+			for _, Chest in TreasureChests.TREASURE_CHESTS do
+				if not table.find(Account.claimedTreasureChestIds, Chest.id) then
+					table.insert(Targets, {
+						Id = TreasureChests.getTreasureChestObjectId(Chest.id),
+						Name = "Treasure chest",
+						Color = Library.Scheme.AccentColor,
+					})
+				end
 			end
 		end
+
+		if Options.MarkerTypes.Value["Mine nodes"] then
+			for Id, Node in Scene.nodesById do
+				local Identity = GetComponent(Node.entity, "MineIdentity")
+
+				if Identity then
+					table.insert(Targets, {
+						Id = Id,
+						Name = Identity.nodeId,
+						Color = Color3.fromRGB(145, 187, 214),
+					})
+				end
+			end
+		end
+
+		MarkerTargets = Targets
+		MarkerNextRefresh = os.clock() + 0.5
+		MarkerSceneEpoch = SceneState.epoch
 	end
 
 	local VisibleTargets = {}
 
-	for _, Target in Targets do
+	for _, Target in MarkerTargets do
+		Target.Position = GetObjectPosition(Target.Id)
+
 		if not Target.Position then
 			continue
 		end
@@ -1101,7 +1629,7 @@ local function TravelToLandmark()
 end
 
 local function StopAutomation()
-	for _, Name in {"AutoFarm", "AutoForage", "AutoSell", "AutoBuy", "AutoRewards", "AutoChests", "AutoGifts"} do
+	for _, Name in {"AutoFarm", "AutoForage", "AutoSell", "AutoBuy", "AutoRewards", "AutoChests", "AutoGifts", "AutoFish", "AutoMine", "AutoCraft"} do
 		Toggles[Name]:SetValue(false)
 	end
 end
@@ -1260,6 +1788,74 @@ local function ResourceMarkers(Generation)
 	end
 end
 
+local function AutoFish(Generation)
+	local function Active()
+		return Fishing.Enabled and Fishing.Generation == Generation and not Library.Unloaded
+	end
+
+	while Active() do
+		if IsReady() and not MovementBusy and ActiveScene.activeSceneIdAtom() == "main-map" then
+			local State = PlayerState.getPlayerState(LocalPlayer)
+
+			if State and State.inBuilding then
+				Fishing.Status = "Leave the house to fish"
+			else
+				Fish(Active)
+			end
+		elseif ActiveScene.activeSceneIdAtom() ~= "main-map" then
+			Fishing.Status = "Return to the main map to fish"
+		end
+
+		task.wait(math.max(1, Fishing.Data.OCEAN_FISHING_COOLDOWN_SECONDS))
+	end
+end
+
+local function AutoMine(Generation)
+	local function Active()
+		return Mining.Enabled and Mining.Generation == Generation and not Library.Unloaded
+	end
+
+	while Active() do
+		if IsReady() and not MovementBusy then
+			local SceneId = ActiveScene.activeSceneIdAtom()
+
+			if Mining.Utilities.isMineSceneId(SceneId) then
+				local NextScene = Mining.Utilities.getNextMineSceneId(SceneId)
+
+				if not (Toggles.MineDescend.Value and NextScene and TravelMine(NextScene, Active)) then
+					Mine(Active)
+				end
+			elseif SceneId == "main-map" and Toggles.EnterMine.Value and GetPickaxe() then
+				local State = PlayerState.getPlayerState(LocalPlayer)
+
+				if State and State.inBuilding then
+					Mining.Status = "Leave the house to enter the mine"
+				else
+					TravelMine("mine-1", Active)
+				end
+			else
+				Mining.Status = GetPickaxe() and "Enter a mine to begin" or "Craft or equip a pickaxe"
+			end
+		end
+
+		task.wait(0.8)
+	end
+end
+
+local function AutoCraft(Generation)
+	local function Active()
+		return Crafting.Enabled and Crafting.Generation == Generation and not Library.Unloaded
+	end
+
+	while Active() do
+		if IsReady() and not MovementBusy then
+			CraftTool(Active)
+		end
+
+		task.wait(3)
+	end
+end
+
 -- Interface
 local Window = Library:CreateWindow({
 	Title = "Caramel",
@@ -1275,6 +1871,9 @@ local Window = Library:CreateWindow({
 local Tabs = {
 	Farm = Window:AddTab("Farm", "sprout"),
 	Gathering = Window:AddTab("Gathering", "leaf"),
+	Fishing = Window:AddTab("Fishing", "fish"),
+	Mining = Window:AddTab("Mining", "pickaxe"),
+	Crafting = Window:AddTab("Crafting", "hammer"),
 	Travel = Window:AddTab("Travel", "map-pin"),
 	Settings = Window:AddTab("Settings", "settings"),
 }
@@ -1356,6 +1955,176 @@ local DiscordGroup = Tabs.Settings:AddGroupbox({
 	Name = "Discord",
 	IconName = "message-circle",
 })
+
+do
+	local FishGroup = Tabs.Fishing:AddGroupbox({
+		Side = "Left",
+		Name = "Auto Fish",
+		IconName = "fish",
+	})
+
+	FishGroup:AddToggle("AutoFish", {
+		Text = "Auto fish",
+		Default = false,
+	})
+
+	FishGroup:AddDropdown("FishingRod", {
+		Values = Fishing.RodNames,
+		Default = 1,
+		Text = "Fishing rod",
+	})
+
+	FishGroup:AddDropdown("FishingSpot", {
+		Values = Fishing.SpotNames,
+		Default = 1,
+		Text = "Fishing spot",
+	})
+
+	Fishing.Label = FishGroup:AddLabel("Idle")
+	Fishing.CountLabel = FishGroup:AddLabel("Fish: 0 | Treasures: 0")
+end
+
+do
+	local MineGroup = Tabs.Mining:AddGroupbox({
+		Side = "Left",
+		Name = "Auto Mine",
+		IconName = "pickaxe",
+	})
+
+	MineGroup:AddToggle("AutoMine", {
+		Text = "Auto mine",
+		Default = false,
+	})
+
+	MineGroup:AddToggle("EnterMine", {
+		Text = "Enter mine automatically",
+		Default = true,
+	})
+
+	MineGroup:AddToggle("MineDescend", {
+		Text = "Descend when a ladder opens",
+		Default = true,
+	})
+
+	MineGroup:AddDropdown("MiningPickaxe", {
+		Values = Mining.PickaxeNames,
+		Default = 1,
+		Text = "Pickaxe",
+	})
+
+	MineGroup:AddDropdown("MiningNodes", {
+		Values = Mining.NodeNames,
+		Default = Mining.NodeNames,
+		Multi = true,
+		Text = "Mine these nodes",
+	})
+
+	MineGroup:AddDropdown("MiningPriority", {
+		Values = {"Nearest", "Ore first"},
+		Default = 1,
+		Text = "Priority",
+	})
+
+	MineGroup:AddButton({
+		Text = "Return to surface",
+		Func = function()
+			if not Mining.Utilities.isMineSceneId(ActiveScene.activeSceneIdAtom()) then
+				return
+			end
+
+			Toggles.AutoMine:SetValue(false)
+			task.spawn(function()
+				local Deadline = os.clock() + 5
+
+				while MovementBusy and not Library.Unloaded and os.clock() < Deadline do
+					task.wait(0.1)
+				end
+
+				if IsReady() and not MovementBusy then
+					TravelMine("surface", function()
+						return not Library.Unloaded
+					end)
+				end
+			end)
+		end,
+	})
+
+	Mining.Label = MineGroup:AddLabel("Idle")
+	Mining.CountLabel = MineGroup:AddLabel("Nodes mined: 0")
+end
+
+do
+	local CraftGroup = Tabs.Crafting:AddGroupbox({
+		Side = "Left",
+		Name = "Tool Workbench",
+		IconName = "hammer",
+	})
+
+	CraftGroup:AddToggle("AutoCraft", {
+		Text = "Auto craft selected tool",
+		Default = false,
+	})
+
+	CraftGroup:AddDropdown("ToolRecipe", {
+		Values = Crafting.Recipes,
+		Default = table.find(Crafting.Recipes, "scrappy-fishing-rod") or 1,
+		Text = "Recipe",
+	})
+
+	CraftGroup:AddSlider("CraftTarget", {
+		Text = "Tools to keep",
+		Default = 1,
+		Min = 1,
+		Max = 5,
+		Rounding = 0,
+	})
+
+	CraftGroup:AddButton({
+		Text = "Visit own workbench",
+		Func = function()
+			if MovementBusy or not IsReady() or ActiveScene.activeSceneIdAtom() ~= "main-map" then
+				return
+			end
+
+			local Account = PlayerSelectors.getLocalAccount()
+			local Plot = PlayerPlot.tryGetLocalPlayerPlot()
+
+			if not Account or not Account.houses.activeHouseId or not Plot then
+				Library:Notify("Build a house and place its included workbench first", 4)
+				return
+			end
+
+			local Character = GetCharacter()
+			local Scene = ActiveScene.activeSceneStateAtom()
+			local Position = require(Shared.utilities.plots).getPlayerHomePosition(Plot) + Vector2.new(0, -40)
+
+			task.spawn(function()
+				local function Active()
+					local Current = ActiveScene.activeSceneStateAtom()
+
+					return not Library.Unloaded and LocalPlayer.Character == Character and Current.sceneId == Scene.sceneId and Current.epoch == Scene.epoch
+				end
+
+				if not BeginMovement(Position, Active) then
+					return
+				end
+
+				Events.enterBuilding()
+				task.wait(0.5)
+
+				if Active() then
+					MovementPivot = nil
+					Crafting.Status = "Inside your house"
+				end
+
+				RestoreMovement(not Active())
+			end)
+		end,
+	})
+
+	Crafting.Label = CraftGroup:AddLabel("Idle")
+	Crafting.CountLabel = CraftGroup:AddLabel("Tools crafted: 0")
+end
 
 CropGroup:AddToggle("AutoFarm", {
 	Text = "Auto farm",
@@ -1516,8 +2285,8 @@ MarkerGroup:AddToggle("ResourceMarkers", {
 })
 
 MarkerGroup:AddDropdown("MarkerTypes", {
-	Values = {"Rare forage", "Ripe crops", "Treasure chests"},
-	Default = {"Rare forage", "Ripe crops", "Treasure chests"},
+	Values = {"Rare forage", "Ripe crops", "Treasure chests", "Mine nodes"},
+	Default = {"Rare forage", "Ripe crops", "Treasure chests", "Mine nodes"},
 	Multi = true,
 	Text = "Show",
 })
@@ -1654,6 +2423,87 @@ ThemeManager:ApplyToTab(Tabs.Settings)
 SaveManager:BuildConfigSection(Tabs.Settings)
 
 -- Events
+Toggles.AutoFish:OnChanged(function()
+	Fishing.Enabled = Toggles.AutoFish.Value
+	Fishing.Generation += 1
+
+	if Fishing.Enabled then
+		task.spawn(AutoFish, Fishing.Generation)
+	else
+		StopFishing()
+		Fishing.Status = "Idle"
+	end
+end)
+
+Toggles.AutoMine:OnChanged(function()
+	Mining.Enabled = Toggles.AutoMine.Value
+	Mining.Generation += 1
+
+	if Mining.Enabled then
+		task.spawn(AutoMine, Mining.Generation)
+	else
+		StopMining()
+		Mining.Status = "Idle"
+	end
+end)
+
+Toggles.AutoCraft:OnChanged(function()
+	Crafting.Enabled = Toggles.AutoCraft.Value
+	Crafting.Generation += 1
+
+	if Crafting.Enabled then
+		task.spawn(AutoCraft, Crafting.Generation)
+	else
+		Crafting.Status = "Idle"
+	end
+end)
+
+Fishing.EndConnection = Events.oceanFishingEnded:connect(function(Result)
+	if Library.Unloaded or not Result.sessionId or not Fishing.Pending[Result.sessionId] or (Result.playerUserId and Result.playerUserId ~= LocalPlayer.UserId) then
+		return
+	end
+
+	local SpotId = Fishing.Pending[Result.sessionId]
+
+	Fishing.Pending[Result.sessionId] = nil
+
+	if Result.reason == "reward" then
+		Fishing.Catches += Result.rewardQuantity or 1
+
+		if Result.treasure then
+			Fishing.Treasures += 1
+		end
+
+		if Fishing.Enabled then
+			Fishing.Status = `Caught: {Result.rewardItemId or "fish"}`
+		end
+	elseif Fishing.Enabled then
+		Fishing.Status = `Fishing: {Result.reason}`
+
+		if Result.reason == "failed" or Result.reason == "missed" or Result.reason == "too-far" then
+			FailedTargets[`fishing:{SpotId}`] = os.clock() + 30
+		end
+	end
+end)
+
+Mining.EndConnection = Events.miningEnded:connect(function(Result)
+	if Library.Unloaded or not Result.sessionId or not Mining.Pending[Result.sessionId] or (Result.playerUserId and Result.playerUserId ~= LocalPlayer.UserId) then
+		return
+	end
+
+	Mining.Pending[Result.sessionId] = nil
+
+	if Result.reason == "reward" then
+		Mining.Nodes += 1
+
+		if Mining.Enabled then
+			Mining.Status = `Collected: {Result.rewardItemId or "ore"}`
+		end
+	elseif Mining.Enabled then
+		Mining.Status = `Mining: {Result.reason}`
+	end
+end)
+
 Toggles.AutoFarm:OnChanged(function()
 	AutoFarmEnabled = Toggles.AutoFarm.Value
 	AutoFarmGeneration += 1
@@ -1768,6 +2618,18 @@ local WalkSpeedHeartbeat = RunService.Heartbeat:Connect(function(DeltaTime)
 end)
 
 Library:OnUnload(function()
+	Fishing.Enabled = false
+	Mining.Enabled = false
+	Crafting.Enabled = false
+	Fishing.Generation += 1
+	Mining.Generation += 1
+	Crafting.Generation += 1
+	StopFishing()
+	StopMining()
+	Fishing.EndConnection:Disconnect()
+	Mining.EndConnection:Disconnect()
+	table.clear(Fishing.Pending)
+	table.clear(Mining.Pending)
 	AutoFarmEnabled = false
 	AutoForageEnabled = false
 	AutoSellEnabled = false
@@ -1834,6 +2696,12 @@ task.spawn(function()
 		ChestCountLabel:SetText(`Chests collected: {SessionChests}`)
 		GiftLabel:SetText(GiftStatus)
 		GiftCountLabel:SetText(`Gifts claimed: {SessionGifts}`)
+		Fishing.Label:SetText(Fishing.Status)
+		Fishing.CountLabel:SetText(`Fish: {Fishing.Catches} | Treasures: {Fishing.Treasures}`)
+		Mining.Label:SetText(Mining.Status)
+		Mining.CountLabel:SetText(`Nodes mined: {Mining.Nodes}`)
+		Crafting.Label:SetText(Crafting.Status)
+		Crafting.CountLabel:SetText(`Tools crafted: {Crafting.Completed}`)
 		task.wait(1)
 	end
 end)
