@@ -473,8 +473,8 @@ local function OpenDiscord()
 end
 
 local function CopyDiscord()
-	setclipboard("https://discord.gg/tazetap")
-	Library:Notify("Copied discord.gg/tazetap", 3)
+	setclipboard("https://https://discord.gg/cyjC3QejpG")
+	Library:Notify("Copied https://discord.gg/cyjC3QejpG", 3)
 end
 
 -- Farm Functions
@@ -1859,7 +1859,7 @@ end
 -- Interface
 local Window = Library:CreateWindow({
 	Title = "Caramel",
-	Footer = "Made with <3 by Taze | discord.gg/tazetap",
+	Footer = "Made with <3 by Taze | https://discord.gg/cyjC3QejpG",
 	Font = FontFace,
 	Size = UDim2.fromOffset(720, 620),
 	Center = true,
@@ -2404,7 +2404,7 @@ MenuGroup:AddButton({
 	end,
 })
 
-DiscordGroup:AddLabel("discord.gg/tazetap")
+DiscordGroup:AddLabel("https://discord.gg/cyjC3QejpG")
 
 DiscordGroup:AddButton({
 	Text = "Copy Discord invite",
@@ -2674,7 +2674,7 @@ end)
 SaveManager:LoadAutoloadConfig()
 Library:SetFont(FontFace)
 
-Library:Notify("Join my community: discord.gg/tazetap", 7)
+Library:Notify("Join my community: https://discord.gg/cyjC3QejpG", 7)
 task.spawn(OpenDiscord)
 
 -- Session Stats
