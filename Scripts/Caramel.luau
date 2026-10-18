@@ -150,7 +150,6 @@ local Fishing = {
 	SpotNames = {"Nearest"},
 	RodNames = {"Best owned"},
 }
-
 local Mining = {
 	Utilities = require(Shared.utilities.mining),
 	Data = require(Shared.data.mining),
@@ -168,7 +167,6 @@ local Mining = {
 	PickaxeNames = {"Best owned"},
 	NodeNames = {},
 }
-
 local Crafting = {
 	Data = require(Shared.data.crafting),
 	Scene = require(Shared.utilities.furniture.scene),
