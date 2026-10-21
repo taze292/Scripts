@@ -153,6 +153,8 @@ local Fishing = {
 local Mining = {
 	Utilities = require(Shared.utilities.mining),
 	Data = require(Shared.data.mining),
+	Types = require(Shared.types.mining),
+	ChestData = require(Shared.data["mine-chests"]),
 	Atom = require(Client.store["mining-atom"]).miningAtom,
 	Runtime = require(Client.store["mining-minigame-runtime-atom"]).miningMinigameRuntimeAtom,
 	Controller = Flamework.resolveDependency("client/controllers/gameplay/items/pickaxe-controller@PickaxeController"),
@@ -163,19 +165,38 @@ local Mining = {
 	SessionId = nil,
 	Status = "Idle",
 	Nodes = 0,
+	Chests = 0,
+	RestartPending = false,
 	Pending = {},
 	PickaxeNames = {"Best owned"},
 	NodeNames = {},
 }
 local Crafting = {
 	Data = require(Shared.data.crafting),
+	Utilities = require(Shared.utilities.crafting),
 	Scene = require(Shared.utilities.furniture.scene),
 	Enabled = false,
 	Generation = 0,
 	Status = "Idle",
 	Recipes = {},
+	RecipeStations = {},
 	Completed = 0,
 }
+local Garden = {
+	Data = require(Shared.data.gardens),
+}
+local Updates = {
+	CodeAtom = require(Client.store["code-redeem-atom"]).codeRedeemAtom,
+	Changelog = require(Shared.data.changelog),
+	Forecast = Flamework.resolveDependency("client/controllers/gameplay/weather-forecast-controller@WeatherForecastController"),
+	NextForecastAt = 0,
+}
+
+for _, Section in Updates.Changelog.CHANGELOG[1].sections do
+	for _, Change in Section.changes do
+		Updates.Code = Updates.Code or string.match(Change, "code%s+([A-Z0-9]+)")
+	end
+end
 
 for ItemId, Data in ItemData do
 	if Data.type == "seeds" and Data.use and CropRegistry.getCropData(Data.use.crop) then
@@ -209,9 +230,12 @@ for _, Area in Fishing.Water.MAIN_MAP_OCEAN_FISHING_AREAS do
 	table.insert(Fishing.SpotNames, Area.id)
 end
 
-for _, Tab in Crafting.Data.CRAFTING_STATIONS["tool-workbench"].tabs do
-	for _, Recipe in Tab.recipes do
-		table.insert(Crafting.Recipes, Recipe.id)
+for StationId, Station in Crafting.Data.CRAFTING_STATIONS do
+	for _, Tab in Station.tabs do
+		for _, Recipe in Tab.recipes do
+			table.insert(Crafting.Recipes, Recipe.id)
+			Crafting.RecipeStations[Recipe.id] = StationId
+		end
 	end
 end
 
@@ -466,15 +490,15 @@ local function OpenDiscord()
 			cmd = "INVITE_BROWSER",
 			nonce = HttpService:GenerateGUID(false),
 			args = {
-				code = "tazetap",
+				code = "cyjC3QejpG",
 			},
 		}),
 	})
 end
 
 local function CopyDiscord()
-	setclipboard("https://https://discord.gg/cyjC3QejpG")
-	Library:Notify("Copied https://discord.gg/cyjC3QejpG", 3)
+	setclipboard("https://discord.gg/cyjC3QejpG")
+	Library:Notify("Copied discord.gg/cyjC3QejpG", 3)
 end
 
 -- Farm Functions
@@ -579,6 +603,29 @@ local function UseCrop(Crop, Action, Position, Active)
 	RestoreMovement(not Active())
 end
 
+local function GetCropLimit()
+	local Account = PlayerSelectors.getLocalAccount()
+
+	for _, Tier in Garden.Data.GARDEN_TIERS do
+		if Account and Tier.id == Account.gardenTierId then
+			return math.min(Options.CropLimit.Value, Tier.cropLimit)
+		end
+	end
+
+	return 0
+end
+
+local function CanPlantTile(CropId, Tile)
+	local Data = CropRegistry.getCropData(CropId)
+	local Crop = {
+		id = "caramel-plant-preview",
+		type = CropId,
+		position = Datastore.serializeVector2Position(Tile),
+	}
+
+	return Data and PlotPlacements.canPlacePlacement(LocalPlayer.UserId, CropUtilities.createCropPlacementState(Crop, Data))
+end
+
 local function FindFreeTile(CropId)
 	local Plot = PlayerPlot.tryGetLocalPlayerPlot()
 	local Data = CropRegistry.getCropData(CropId)
@@ -597,7 +644,7 @@ local function FindFreeTile(CropId)
 				continue
 			end
 
-			if PlotPlacements.areTilesFree(LocalPlayer.UserId, Grid.getTilesOccupied(Tile, Data.gridSize)) then
+			if CanPlantTile(CropId, Tile) then
 				return Tile, Grid.calculateCropWorldPosition(Tile, Plot.origin, Data.gridSize, Size)
 			end
 		end
@@ -628,15 +675,13 @@ local function PlantCrop(Active)
 	if
 		not Toggles.PlantCrops.Value or CurrentCropId ~= CropId
 		or CurrentContainer ~= Container or CurrentIndex ~= Index
-		or #PlayerSelectors.getLocalCrops() >= Options.CropLimit.Value
+		or #PlayerSelectors.getLocalCrops() >= GetCropLimit()
 	then
 		RestoreMovement(false)
 		return
 	end
 
-	local Data = CropRegistry.getCropData(CropId)
-
-	if not PlotPlacements.areTilesFree(LocalPlayer.UserId, Grid.getTilesOccupied(Tile, Data.gridSize)) then
+	if not CanPlantTile(CropId, Tile) then
 		RestoreMovement(false)
 		return
 	end
@@ -909,6 +954,63 @@ local function Fish(Active)
 end
 
 -- Mining Functions
+local function GetMineChest()
+	local Floor = Mining.Utilities.getMineFloorFromSceneId(ActiveScene.activeSceneIdAtom())
+
+	if not Floor then
+		return
+	end
+
+	local Id = Mining.ChestData.getMineChestObjectId(Floor)
+	local Node = SceneReplica.getAuthoritativeScene().nodesById[Id]
+	local Interaction = Node and GetComponent(Node.entity, "Interactable")
+	local Action = Interaction and Interaction.action
+	local Position = Node and GetObjectPosition(Id)
+
+	if Interaction and Interaction.enabled ~= false and Action and Action.type == "custom" and Action.eventId == Mining.ChestData.MINE_CHEST_INTERACT_EVENT_ID and Position then
+		return Id, Position, Action
+	end
+end
+
+local function OpenMineChest(Id, Position, Action, Active)
+	local Key = `mine-chest:{ActiveScene.activeSceneStateAtom().epoch}:{Id}`
+
+	if not CanRetry(Key) then
+		Mining.Status = "Waiting to retry mine chest"
+		return
+	end
+
+	if not BeginMovement(Position + Vector2.new(0, 20), Active) then
+		return
+	end
+
+	local Sprite = Sugar.Renderer.query:get(Id)
+	local CurrentId = GetMineChest()
+
+	if CurrentId ~= Id or not Sprite then
+		RestoreMovement(not Active())
+		return
+	end
+
+	Mining.Status = "Opening mine chest"
+	Sugar.events.interaction:Fire(Action, Sprite)
+
+	if WaitForResult(function()
+		local Node = SceneReplica.getAuthoritativeScene().nodesById[Id]
+		local Interaction = Node and GetComponent(Node.entity, "Interactable")
+
+		return not Node or not Interaction or Interaction.enabled == false
+	end, Active) then
+		Mining.Chests += 1
+		Mining.Status = "Mine chest collected"
+	elseif Active() then
+		Mining.Status = "Mine chest was not confirmed"
+		FailedTargets[Key] = os.clock() + 15
+	end
+
+	RestoreMovement(not Active())
+end
+
 local function GetMineTarget(Stats)
 	local Position = CharacterPosition.getPlayerFeetPosition(LocalPlayer)
 	local BestId = nil
@@ -1059,12 +1161,12 @@ local function Mine(Active)
 end
 
 -- Crafting Functions
-local function GetWorkbench()
+local function GetWorkbench(StationId)
 	local Account = PlayerSelectors.getLocalAccount()
 	local Scene = SceneReplica.getAuthoritativeScene()
 
 	for Id, Node in Scene.nodesById do
-		if Crafting.Data.getWorldCraftingStationId(Node.entity.objectRegistryId or "") == "tool-workbench" then
+		if Crafting.Utilities.getWorldCraftingStationId(Node.entity.objectRegistryId or "") == StationId then
 			local Position = GetObjectPosition(Id)
 
 			if Position then
@@ -1077,7 +1179,7 @@ local function GetWorkbench()
 		for _, Furniture in House.furniture do
 			local Definition = Crafting.Scene.getPlacedFurnitureDefinition(Furniture)
 
-			if Furniture.ownerUserId == LocalPlayer.UserId and Definition and Definition.craftingStationId == "tool-workbench" then
+			if Furniture.ownerUserId == LocalPlayer.UserId and Definition and Definition.craftingStationId == StationId then
 				local Position = GetObjectPosition(Furniture.id)
 
 				if Position then
@@ -1088,8 +1190,9 @@ local function GetWorkbench()
 	end
 end
 
-local function CraftTool(Active)
-	local Recipe = Crafting.Data.getCraftingRecipe("tool-workbench", Options.ToolRecipe.Value)
+local function CraftItem(Active)
+	local StationId = Crafting.RecipeStations[Options.ToolRecipe.Value]
+	local Recipe = StationId and Crafting.Utilities.getCraftingRecipe(StationId, Options.ToolRecipe.Value)
 	local Account = PlayerSelectors.getLocalAccount()
 
 	if not Recipe or not Account then
@@ -1115,10 +1218,10 @@ local function CraftTool(Active)
 		return
 	end
 
-	local Target, Position = GetWorkbench()
+	local Target, Position = GetWorkbench(StationId)
 
 	if not Target then
-		Crafting.Status = "Visit your tool workbench"
+		Crafting.Status = StationId == "tool-workbench" and "Visit your tool workbench" or "Visit your furniture workbench"
 		return
 	end
 
@@ -1126,7 +1229,7 @@ local function CraftTool(Active)
 		return
 	end
 
-	Crafting.Status = "Crafting tool"
+	Crafting.Status = "Crafting item"
 	local Before = CountItem(Recipe.rewards[1].itemId)
 	local Success, Resolved, Response = pcall(function()
 		return Network.Functions.craftItem:invokeWithTimeout(10, {
@@ -1141,7 +1244,7 @@ local function CraftTool(Active)
 			return CountItem(Recipe.rewards[1].itemId) > Before
 		end, Active) then
 			Crafting.Completed += 1
-			Crafting.Status = "Tool crafted"
+			Crafting.Status = "Item crafted"
 		else
 			Crafting.Status = "Craft was not confirmed"
 		end
@@ -1164,7 +1267,8 @@ local function GetSellSlots()
 	end
 
 	if Crafting.Enabled then
-		local Recipe = Crafting.Data.getCraftingRecipe("tool-workbench", Options.ToolRecipe.Value)
+		local StationId = Crafting.RecipeStations[Options.ToolRecipe.Value]
+		local Recipe = StationId and Crafting.Utilities.getCraftingRecipe(StationId, Options.ToolRecipe.Value)
 
 		if Recipe and CountItem(Recipe.rewards[1].itemId) < Options.CraftTarget.Value then
 			for _, Ingredient in Recipe.ingredients do
@@ -1642,14 +1746,20 @@ local function AutoFarm(Generation)
 
 	while Active() do
 		if IsReady() and not MovementBusy and ActiveScene.activeSceneIdAtom() == "main-map" then
-			local Crop, Action, Position = GetCropTarget()
+			local State = PlayerState.getPlayerState(LocalPlayer)
 
-			if Crop then
-				UseCrop(Crop, Action, Position, Active)
-			elseif Toggles.PlantCrops.Value and #PlayerSelectors.getLocalCrops() < Options.CropLimit.Value then
-				PlantCrop(Active)
+			if State and State.inBuilding then
+				FarmStatus = "Leave the house to farm"
 			else
-				FarmStatus = "Waiting for crops"
+				local Crop, Action, Position = GetCropTarget()
+
+				if Crop then
+					UseCrop(Crop, Action, Position, Active)
+				elseif Toggles.PlantCrops.Value and #PlayerSelectors.getLocalCrops() < GetCropLimit() then
+					PlantCrop(Active)
+				else
+					FarmStatus = "Waiting for crops"
+				end
 			end
 		end
 
@@ -1820,18 +1930,28 @@ local function AutoMine(Generation)
 			local SceneId = ActiveScene.activeSceneIdAtom()
 
 			if Mining.Utilities.isMineSceneId(SceneId) then
+				local ChestId, ChestPosition, ChestAction = GetMineChest()
+				local Floor = Mining.Utilities.getMineFloorFromSceneId(SceneId)
 				local NextScene = Mining.Utilities.getNextMineSceneId(SceneId)
 
-				if not (Toggles.MineDescend.Value and NextScene and TravelMine(NextScene, Active)) then
+				if Toggles.MineChestPriority.Value and ChestId then
+					OpenMineChest(ChestId, ChestPosition, ChestAction, Active)
+				elseif Toggles.MineRestart.Value and Floor and Floor >= Mining.Types.MAX_RESOURCE_MINE_FLOOR then
+					if TravelMine("surface", Active) and Active() then
+						Mining.RestartPending = true
+					end
+				elseif not (Toggles.MineDescend.Value and NextScene and TravelMine(NextScene, Active)) then
 					Mine(Active)
 				end
-			elseif SceneId == "main-map" and Toggles.EnterMine.Value and GetPickaxe() then
+			elseif SceneId == "main-map" and (Toggles.EnterMine.Value or (Toggles.MineRestart.Value and Mining.RestartPending)) and GetPickaxe() then
 				local State = PlayerState.getPlayerState(LocalPlayer)
 
 				if State and State.inBuilding then
 					Mining.Status = "Leave the house to enter the mine"
 				else
-					TravelMine("mine-1", Active)
+					if TravelMine("mine-1", Active) then
+						Mining.RestartPending = false
+					end
 				end
 			else
 				Mining.Status = GetPickaxe() and "Enter a mine to begin" or "Craft or equip a pickaxe"
@@ -1849,7 +1969,7 @@ local function AutoCraft(Generation)
 
 	while Active() do
 		if IsReady() and not MovementBusy then
-			CraftTool(Active)
+			CraftItem(Active)
 		end
 
 		task.wait(3)
@@ -1859,7 +1979,7 @@ end
 -- Interface
 local Window = Library:CreateWindow({
 	Title = "Caramel",
-	Footer = "Made with <3 by Taze | https://discord.gg/cyjC3QejpG",
+	Footer = "Made with <3 by Taze | discord.gg/cyjC3QejpG",
 	Font = FontFace,
 	Size = UDim2.fromOffset(720, 620),
 	Center = true,
@@ -2006,6 +2126,16 @@ do
 		Default = true,
 	})
 
+	MineGroup:AddToggle("MineChestPriority", {
+		Text = "Prioritize mine treasure chests",
+		Default = true,
+	})
+
+	MineGroup:AddToggle("MineRestart", {
+		Text = "Restart after floor 30",
+		Default = false,
+	})
+
 	MineGroup:AddDropdown("MiningPickaxe", {
 		Values = Mining.PickaxeNames,
 		Default = 1,
@@ -2050,18 +2180,18 @@ do
 	})
 
 	Mining.Label = MineGroup:AddLabel("Idle")
-	Mining.CountLabel = MineGroup:AddLabel("Nodes mined: 0")
+	Mining.CountLabel = MineGroup:AddLabel("Nodes mined: 0 | Chests: 0")
 end
 
 do
 	local CraftGroup = Tabs.Crafting:AddGroupbox({
 		Side = "Left",
-		Name = "Tool Workbench",
+		Name = "Workbench",
 		IconName = "hammer",
 	})
 
 	CraftGroup:AddToggle("AutoCraft", {
-		Text = "Auto craft selected tool",
+		Text = "Auto craft selected item",
 		Default = false,
 	})
 
@@ -2069,10 +2199,11 @@ do
 		Values = Crafting.Recipes,
 		Default = table.find(Crafting.Recipes, "scrappy-fishing-rod") or 1,
 		Text = "Recipe",
+		Searchable = true,
 	})
 
 	CraftGroup:AddSlider("CraftTarget", {
-		Text = "Tools to keep",
+		Text = "Items to keep",
 		Default = 1,
 		Min = 1,
 		Max = 5,
@@ -2090,7 +2221,7 @@ do
 			local Plot = PlayerPlot.tryGetLocalPlayerPlot()
 
 			if not Account or not Account.houses.activeHouseId or not Plot then
-				Library:Notify("Build a house and place its included workbench first", 4)
+				Library:Notify("Build a house and place a workbench first", 4)
 				return
 			end
 
@@ -2123,7 +2254,18 @@ do
 	})
 
 	Crafting.Label = CraftGroup:AddLabel("Idle")
-	Crafting.CountLabel = CraftGroup:AddLabel("Tools crafted: 0")
+	Crafting.CountLabel = CraftGroup:AddLabel("Items crafted: 0")
+end
+
+do
+	local ForecastGroup = Tabs.Gathering:AddGroupbox({
+		Side = "Right",
+		Name = "Weather Forecast",
+		IconName = "cloud-sun",
+	})
+
+	Updates.WeatherLabel = ForecastGroup:AddLabel("Next weather: unknown")
+	Updates.TimeLabel = ForecastGroup:AddLabel("Waiting for forecast")
 end
 
 CropGroup:AddToggle("AutoFarm", {
@@ -2161,6 +2303,7 @@ CropGroup:AddSlider("CropLimit", {
 })
 
 local FarmLabel = CropGroup:AddLabel("Idle")
+Garden.Label = CropGroup:AddLabel("Crop target: 0")
 
 SupplyGroup:AddToggle("AutoBuy", {
 	Text = "Restock selected seeds",
@@ -2275,6 +2418,19 @@ GiftGroup:AddToggle("ClaimMail", {
 	Text = "Claim mail attachments",
 	Default = true,
 })
+
+if Updates.Code then
+	GiftGroup:AddButton({
+		Text = `Redeem {Updates.Code}`,
+		Func = function()
+			local State = Updates.CodeAtom()
+
+			if not Library.Unloaded and not State.coolingDown and State.status ~= "checking" then
+				Signals.requestCodeRedeem:Fire(Updates.Code)
+			end
+		end,
+	})
+end
 
 local GiftLabel = GiftGroup:AddLabel("Idle")
 local GiftCountLabel = GiftGroup:AddLabel("Gifts claimed: 0")
@@ -2404,7 +2560,7 @@ MenuGroup:AddButton({
 	end,
 })
 
-DiscordGroup:AddLabel("https://discord.gg/cyjC3QejpG")
+DiscordGroup:AddLabel("discord.gg/cyjC3QejpG")
 
 DiscordGroup:AddButton({
 	Text = "Copy Discord invite",
@@ -2443,8 +2599,13 @@ Toggles.AutoMine:OnChanged(function()
 		task.spawn(AutoMine, Mining.Generation)
 	else
 		StopMining()
+		Mining.RestartPending = false
 		Mining.Status = "Idle"
 	end
+end)
+
+Toggles.MineRestart:OnChanged(function()
+	Mining.RestartPending = false
 end)
 
 Toggles.AutoCraft:OnChanged(function()
@@ -2674,7 +2835,7 @@ end)
 SaveManager:LoadAutoloadConfig()
 Library:SetFont(FontFace)
 
-Library:Notify("Join my community: https://discord.gg/cyjC3QejpG", 7)
+Library:Notify("Join my community: discord.gg/cyjC3QejpG", 7)
 task.spawn(OpenDiscord)
 
 -- Session Stats
@@ -2699,9 +2860,19 @@ task.spawn(function()
 		Fishing.Label:SetText(Fishing.Status)
 		Fishing.CountLabel:SetText(`Fish: {Fishing.Catches} | Treasures: {Fishing.Treasures}`)
 		Mining.Label:SetText(Mining.Status)
-		Mining.CountLabel:SetText(`Nodes mined: {Mining.Nodes}`)
+		Mining.CountLabel:SetText(`Nodes mined: {Mining.Nodes} | Chests: {Mining.Chests}`)
 		Crafting.Label:SetText(Crafting.Status)
-		Crafting.CountLabel:SetText(`Tools crafted: {Crafting.Completed}`)
+		Crafting.CountLabel:SetText(`Items crafted: {Crafting.Completed}`)
+		Garden.Label:SetText(`Crops: {#PlayerSelectors.getLocalCrops()} / {GetCropLimit()}`)
+
+		if os.clock() >= Updates.NextForecastAt then
+			local Forecast = Updates.Forecast:getForecastParameters()
+
+			Updates.WeatherLabel:SetText(`Next weather: {Forecast.forecastWeather}`)
+			Updates.TimeLabel:SetText(`{Forecast.forecastStart} - {Forecast.forecastEnd}`)
+			Updates.NextForecastAt = os.clock() + 5
+		end
+
 		task.wait(1)
 	end
 end)
