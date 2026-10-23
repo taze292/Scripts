@@ -65,7 +65,6 @@ Library.Scheme.AccentColor = Color3.fromRGB(209, 164, 111)
 Library.Scheme.OutlineColor = Color3.fromRGB(43, 43, 48)
 Library.Scheme.FontColor = Color3.fromRGB(237, 231, 222)
 Library.Scheme.Font = FontFace
-Library.ScreenGui.Parent = LocalPlayer.PlayerGui
 Environment.Caramel = Library
 
 -- Settings
@@ -111,9 +110,13 @@ local ForageIds = {
 	["Dewcap"] = "dewcap",
 	["Gleaming Stone"] = "gem-stone",
 	["Loose Rock"] = "loose-rock",
+	["Moonthistle"] = "moonthistle",
 	["Mushroom"] = "mushroom",
 	["Pebbles"] = "pebbles",
+	["Rainblossom"] = "rainblossom",
 	["Seashell"] = "seashell",
+	["Starfall Petal"] = "starfall-petal",
+	["Zephyr Bloom"] = "zephyr-bloom",
 }
 local SessionStartedAt = os.clock()
 local SessionGold = PlayerSelectors.getLocalAccount().gold
@@ -184,12 +187,27 @@ local Crafting = {
 }
 local Garden = {
 	Data = require(Shared.data.gardens),
+	SickleData = require(Shared.data.sickles),
+	Sickle = require(Shared.utilities.sickle),
+}
+local Foraging = {
+	Data = require(Shared.data.foraging),
+	Ambience = require(Shared.store.ambience["ambience-atom"]).ambienceAtom,
+	Conditions = require(Shared.data.ambience),
 }
 local Updates = {
 	CodeAtom = require(Client.store["code-redeem-atom"]).codeRedeemAtom,
 	Changelog = require(Shared.data.changelog),
 	Forecast = Flamework.resolveDependency("client/controllers/gameplay/weather-forecast-controller@WeatherForecastController"),
 	NextForecastAt = 0,
+}
+local Trading = {
+	Conversation = require(Client.store["conversation-atom"]).conversationAtom,
+	Window = require(Client.store["window-atom"]),
+	Dialogue = Flamework.resolveDependency("client/controllers/presentation/dialogue-controller@DialogueController"),
+	Owned = false,
+	NpcId = nil,
+	SellStatus = "Idle",
 }
 
 for _, Section in Updates.Changelog.CHANGELOG[1].sections do
@@ -548,6 +566,22 @@ local function GetCropTarget()
 	return BestCrop, BestAction, BestPosition
 end
 
+local function GetBestSickle()
+	local BestId = nil
+	local BestArea = 0
+
+	for Id, Swing in Garden.SickleData.SICKLE_SWINGS_BY_ITEM_ID do
+		local Area = Swing.pattern == "square" and (Swing.radius * 2 + 1) ^ 2 or 1 + 2 * Swing.radius * (Swing.radius + 1)
+
+		if Area > BestArea and CountItem(Id) > 0 then
+			BestId = Id
+			BestArea = Area
+		end
+	end
+
+	return BestId
+end
+
 local function UseCrop(Crop, Action, Position, Active)
 	if not BeginMovement(Position, Active) then
 		return
@@ -561,6 +595,7 @@ local function UseCrop(Crop, Action, Position, Active)
 	end
 
 	FarmStatus = `{Action}: {Crop.type}`
+	local Targets = {CurrentCrop}
 
 	if Action == "Harvest" then
 		local Data = CropRegistry.getCropData(CurrentCrop.type)
@@ -570,7 +605,14 @@ local function UseCrop(Crop, Action, Position, Active)
 			return
 		end
 
-		Events.harvestCrop(SceneContext.createSceneRequestContext("crop-harvest"), Crop.id)
+		local SickleId = Toggles.UseSickle.Value and GetBestSickle()
+
+		if SickleId then
+			Targets = Garden.Sickle.getRipeCropsInSickleSwing(PlayerSelectors.getLocalCrops(), CurrentCrop, Garden.Sickle.getSickleSwing(SickleId))
+			Events.harvestCropsWithSickle(SceneContext.createSceneRequestContext("sickle-swing"), SickleId, Crop.id)
+		else
+			Events.harvestCrop(SceneContext.createSceneRequestContext("crop-harvest"), Crop.id)
+		end
 	else
 		if not Toggles.WaterCrops.Value or not CropUtilities.canWaterCrop(CurrentCrop, CropRegistry.getCropData(CurrentCrop.type)) then
 			RestoreMovement(false)
@@ -581,18 +623,32 @@ local function UseCrop(Crop, Action, Position, Active)
 	end
 
 	local Confirmed = WaitForResult(function()
-		local Updated = PlayerSelectors.getLocalCropById(Crop.id)
-
 		if Action == "Water" then
+			local Updated = PlayerSelectors.getLocalCropById(Crop.id)
+
 			return Updated and Updated.watered == true
 		end
 
-		return not Updated or Updated.timesHarvested > CurrentCrop.timesHarvested or Updated.stage ~= CurrentCrop.stage
+		for _, Target in Targets do
+			local Updated = PlayerSelectors.getLocalCropById(Target.id)
+
+			if not Updated or Updated.timesHarvested > Target.timesHarvested or Updated.stage ~= Target.stage then
+				return true
+			end
+		end
+
+		return false
 	end, Active)
 
 	if Confirmed then
 		if Action == "Harvest" then
-			SessionHarvests += 1
+			for _, Target in Targets do
+				local Updated = PlayerSelectors.getLocalCropById(Target.id)
+
+				if not Updated or Updated.timesHarvested > Target.timesHarvested or Updated.stage ~= Target.stage then
+					SessionHarvests += 1
+				end
+			end
 		else
 			SessionWatered += 1
 		end
@@ -709,6 +765,20 @@ local function PlantCrop(Active)
 end
 
 -- Gathering Functions
+local function CanForage()
+	local State = Foraging.Ambience()
+
+	if Toggles.ForageRainOnly.Value and State.weather ~= Foraging.Conditions.Weather.RAINY then
+		return false, "Waiting for rain"
+	end
+
+	if Toggles.ForageNightOnly.Value and not Foraging.Conditions.isNightTimeOfDay(State.timeOfDay) then
+		return false, "Waiting for evening or night"
+	end
+
+	return true
+end
+
 local function GetForageTarget()
 	local Position = CharacterPosition.getPlayerFeetPosition(LocalPlayer)
 	local BestId = nil
@@ -760,7 +830,7 @@ local function CollectForage(Id, Name, Position, Active)
 		return
 	end
 
-	if not SceneReplica.getAuthoritativeScene().nodesById[Id] then
+	if not CanForage() or not SceneReplica.getAuthoritativeScene().nodesById[Id] then
 		RestoreMovement(false)
 		return
 	end
@@ -1256,6 +1326,86 @@ local function CraftItem(Active)
 end
 
 -- Trading Functions
+function Trading.Close()
+	if not Trading.Owned then
+		return
+	end
+
+	local State = Trading.Conversation()
+
+	if not State.active or State.npcId == Trading.NpcId then
+		Trading.Window.windowAtom(Trading.Window.Window.NONE)
+		Trading.Dialogue:abortActiveConversation()
+	end
+
+	Trading.Owned = false
+	Trading.NpcId = nil
+end
+
+function Trading.Open(NpcId, ChoiceId, WindowId, Active)
+	local Node = SceneReplica.getAuthoritativeScene().nodesById[NpcId]
+	local Interaction = Node and GetComponent(Node.entity, "Interactable")
+	local Object = Sugar.Renderer.query:get(NpcId)
+
+	if not Object or not Interaction or Interaction.enabled == false or not BeginMovement(Object:getPosition() + Vector2.new(0, 20), Active) then
+		return false
+	end
+
+	Trading.Owned = true
+	Trading.NpcId = NpcId
+	Sugar.events.interaction:Fire(Interaction.action, Object)
+
+	local Deadline = os.clock() + 12
+	local Selected = false
+
+	while ToolMovementValid(Active) and os.clock() < Deadline do
+		if Trading.Window.windowAtom() == WindowId then
+			return true
+		end
+
+		local State = Trading.Conversation()
+
+		if State.active and State.npcId == NpcId then
+			if #State.choices > 0 and not Selected then
+				for Index, Choice in State.choices do
+					if Choice.id == ChoiceId and not Choice.disabled then
+						Trading.Dialogue:selectChoice(Index - 1)
+						Selected = true
+						break
+					end
+				end
+
+				if not Selected then
+					break
+				end
+			elseif #State.choices == 0 and not Selected then
+				Trading.Dialogue:advance()
+			end
+		end
+
+		task.wait(0.2)
+	end
+
+	Trading.Close()
+	RestoreMovement(not Active())
+
+	return false
+end
+
+function Trading.Wait(Check, Active)
+	local Deadline = os.clock() + 4
+
+	while ToolMovementValid(Active) and os.clock() < Deadline do
+		if Check() then
+			return true
+		end
+
+		task.wait(0.1)
+	end
+
+	return false
+end
+
 local function GetSellSlots()
 	local Account = PlayerSelectors.getLocalAccount()
 	local Totals = {}
@@ -1308,24 +1458,42 @@ end
 local function SellItems(Active)
 	local Slots = GetSellSlots()
 
-	if #Slots == 0 or not Active() or not IsReady() then
+	if #Slots == 0 then
+		Trading.SellStatus = "No eligible inventory items"
 		return
 	end
 
+	Trading.SellStatus = "Visiting Kalt"
+
+	if not Trading.Open("kalt", "sell_select", Trading.Window.Window.INVENTORY, Active) then
+		Trading.SellStatus = "Kalt is unavailable"
+		return
+	end
+
+	Slots = GetSellSlots()
 	local Before = PlayerSelectors.getLocalAccount().gold
 
-	Events.sellInventorySlots(Slots)
+	if #Slots > 0 and Active() then
+		Trading.SellStatus = "Selling inventory"
+		Events.sellInventorySlots(Slots)
 
-	if WaitForResult(function()
-		local Account = PlayerSelectors.getLocalAccount()
+		if Trading.Wait(function()
+			local Account = PlayerSelectors.getLocalAccount()
 
-		return Account and Account.gold > Before
-	end, Active) then
-		SessionSales += 1
+			return Account and Account.gold > Before
+		end, Active) then
+			SessionSales += 1
+			Trading.SellStatus = "Inventory sold"
+		elseif Active() then
+			Trading.SellStatus = "Sale was not confirmed"
+		end
 	end
+
+	Trading.Close()
+	RestoreMovement(not Active())
 end
 
-local function BuySeeds(Active)
+function Trading.Restock(Active)
 	local ItemId = SeedIds[Options.Seed.Value]
 	local Data = ItemId and ItemUtilities.getItemData(ItemId)
 
@@ -1341,7 +1509,7 @@ local function BuySeeds(Active)
 	end
 
 	for _ = 1, Needed do
-		if not Active() or not IsReady() or SeedIds[Options.Seed.Value] ~= ItemId then
+		if not ToolMovementValid(Active) or SeedIds[Options.Seed.Value] ~= ItemId then
 			return
 		end
 
@@ -1422,6 +1590,39 @@ local function BuySeeds(Active)
 	end
 
 	SupplyStatus = CountItem(ItemId) >= Options.SeedReserve.Value and "Seeds stocked" or "Refilling seeds"
+end
+
+local function BuySeeds(Active)
+	local ItemId = SeedIds[Options.Seed.Value]
+	local Account = PlayerSelectors.getLocalAccount()
+	local Data = ItemId and ItemUtilities.getItemData(ItemId)
+	local Quote = Account and Data and ShopPrice.quoteCropShopPrice(Data, Account, 1)
+
+	if not Quote or not Quote.gold then
+		SupplyStatus = "Seed price unavailable"
+		return
+	end
+
+	if CountItem(ItemId) >= Options.SeedReserve.Value then
+		SupplyStatus = "Seeds stocked"
+		return
+	end
+
+	if Account.gold - Quote.gold < Options.GoldReserve.Value then
+		SupplyStatus = "Gold reserve reached"
+		return
+	end
+
+	SupplyStatus = "Visiting Maya"
+
+	if not Trading.Open("maya", "open_seed_shop", Trading.Window.Window.CROP_SHOP, Active) then
+		SupplyStatus = "Maya is unavailable"
+		return
+	end
+
+	Trading.Restock(Active)
+	Trading.Close()
+	RestoreMovement(not Active())
 end
 
 -- Treasure Functions
@@ -1774,12 +1975,18 @@ local function AutoForage(Generation)
 
 	while Active() do
 		if IsReady() and not MovementBusy then
-			local Id, Name, Position = GetForageTarget()
+			local Allowed, Status = CanForage()
 
-			if Id then
-				CollectForage(Id, Name, Position, Active)
+			if not Allowed then
+				ForageStatus = Status
 			else
-				ForageStatus = "No selected forage nearby"
+				local Id, Name, Position = GetForageTarget()
+
+				if Id then
+					CollectForage(Id, Name, Position, Active)
+				else
+					ForageStatus = "No selected forage nearby"
+				end
 			end
 		end
 
@@ -1793,7 +2000,7 @@ local function AutoSell(Generation)
 	end
 
 	while Active() do
-		if IsReady() then
+		if IsReady() and not MovementBusy and ActiveScene.activeSceneIdAtom() == "main-map" then
 			SellItems(Active)
 		end
 
@@ -1807,7 +2014,7 @@ local function AutoBuy(Generation)
 	end
 
 	while Active() do
-		if IsReady() then
+		if IsReady() and not MovementBusy and ActiveScene.activeSceneIdAtom() == "main-map" then
 			BuySeeds(Active)
 		end
 
@@ -2278,6 +2485,11 @@ CropGroup:AddToggle("HarvestCrops", {
 	Default = true,
 })
 
+CropGroup:AddToggle("UseSickle", {
+	Text = "Use best owned sickle",
+	Default = true,
+})
+
 CropGroup:AddToggle("WaterCrops", {
 	Text = "Water growing crops",
 	Default = true,
@@ -2361,6 +2573,8 @@ SaleGroup:AddDropdown("ProtectedItems", {
 	Searchable = true,
 })
 
+Trading.Label = SaleGroup:AddLabel("Idle")
+
 local TimeLabel = StatsGroup:AddLabel("Time: 0m")
 local GoldLabel = StatsGroup:AddLabel("Gold change: 0")
 local CropLabel = StatsGroup:AddLabel("Planted: 0 | Watered: 0")
@@ -2372,9 +2586,19 @@ ForageGroup:AddToggle("AutoForage", {
 	Default = false,
 })
 
+ForageGroup:AddToggle("ForageRainOnly", {
+	Text = "Only forage during rain",
+	Default = false,
+})
+
+ForageGroup:AddToggle("ForageNightOnly", {
+	Text = "Only forage at night",
+	Default = false,
+})
+
 ForageGroup:AddDropdown("ForageTypes", {
-	Values = {"Dewcap", "Gleaming Stone", "Loose Rock", "Mushroom", "Pebbles", "Seashell"},
-	Default = {"Dewcap", "Gleaming Stone", "Loose Rock", "Mushroom", "Pebbles", "Seashell"},
+	Values = {"Dewcap", "Gleaming Stone", "Loose Rock", "Moonthistle", "Mushroom", "Pebbles", "Rainblossom", "Seashell", "Starfall Petal", "Zephyr Bloom"},
+	Default = {"Dewcap", "Gleaming Stone", "Loose Rock", "Moonthistle", "Mushroom", "Pebbles", "Rainblossom", "Seashell", "Starfall Petal", "Zephyr Bloom"},
 	Multi = true,
 	Text = "Collect",
 })
@@ -2693,6 +2917,8 @@ Toggles.AutoSell:OnChanged(function()
 
 	if AutoSellEnabled then
 		task.spawn(AutoSell, AutoSellGeneration)
+	else
+		Trading.SellStatus = "Idle"
 	end
 end)
 
@@ -2787,6 +3013,7 @@ Library:OnUnload(function()
 	Crafting.Generation += 1
 	StopFishing()
 	StopMining()
+	Trading.Close()
 	Fishing.EndConnection:Disconnect()
 	Mining.EndConnection:Disconnect()
 	table.clear(Fishing.Pending)
@@ -2833,9 +3060,10 @@ Library:OnUnload(function()
 end)
 
 SaveManager:LoadAutoloadConfig()
-Library:SetFont(FontFace)
 
-Library:Notify("Join my community: discord.gg/cyjC3QejpG", 7)
+pcall(function()
+	Library:Notify("Join my community: discord.gg/cyjC3QejpG", 7)
+end)
 task.spawn(OpenDiscord)
 
 -- Session Stats
@@ -2853,6 +3081,7 @@ task.spawn(function()
 		FarmLabel:SetText(FarmStatus)
 		ForageLabel:SetText(ForageStatus)
 		SupplyLabel:SetText(SupplyStatus)
+		Trading.Label:SetText(Trading.SellStatus)
 		ChestLabel:SetText(ChestStatus)
 		ChestCountLabel:SetText(`Chests collected: {SessionChests}`)
 		GiftLabel:SetText(GiftStatus)
