@@ -38,6 +38,8 @@ local Flamework = require(ReplicatedStorage.rbxts_include.node_modules["@flamewo
 local DailyRewardController = Flamework.resolveDependency("client/controllers/gameplay/daily-reward-controller@DailyRewardController")
 
 -- UI Init
+setthreadidentity(8)
+
 local Environment = getgenv()
 
 if Environment.Caramel and not Environment.Caramel.Unloaded then
@@ -2184,6 +2186,8 @@ local function AutoCraft(Generation)
 end
 
 -- Interface
+setthreadidentity(8)
+
 local Window = Library:CreateWindow({
 	Title = "Caramel",
 	Footer = "Made with <3 by Taze | discord.gg/cyjC3QejpG",
@@ -3072,6 +3076,7 @@ task.spawn(function()
 		local Account = PlayerSelectors.getLocalAccount()
 		local Minutes = math.floor((os.clock() - SessionStartedAt) / 60)
 
+		setthreadidentity(8)
 		TimeLabel:SetText(`Time: {Minutes}m`)
 		GoldLabel:SetText(`Gold change: {Account and Account.gold - SessionGold or 0}`)
 		CropLabel:SetText(`Planted: {SessionPlants} | Watered: {SessionWatered}`)
@@ -3092,11 +3097,16 @@ task.spawn(function()
 		Mining.CountLabel:SetText(`Nodes mined: {Mining.Nodes} | Chests: {Mining.Chests}`)
 		Crafting.Label:SetText(Crafting.Status)
 		Crafting.CountLabel:SetText(`Items crafted: {Crafting.Completed}`)
-		Garden.Label:SetText(`Crops: {#PlayerSelectors.getLocalCrops()} / {GetCropLimit()}`)
+
+		local CropText = `Crops: {#PlayerSelectors.getLocalCrops()} / {GetCropLimit()}`
+
+		setthreadidentity(8)
+		Garden.Label:SetText(CropText)
 
 		if os.clock() >= Updates.NextForecastAt then
 			local Forecast = Updates.Forecast:getForecastParameters()
 
+			setthreadidentity(8)
 			Updates.WeatherLabel:SetText(`Next weather: {Forecast.forecastWeather}`)
 			Updates.TimeLabel:SetText(`{Forecast.forecastStart} - {Forecast.forecastEnd}`)
 			Updates.NextForecastAt = os.clock() + 5
